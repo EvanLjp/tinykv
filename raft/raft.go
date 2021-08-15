@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"github.com/pingcap-incubator/tinykv/log"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -164,8 +165,11 @@ func newRaft(c *Config) *Raft {
 	if err := c.validate(); err != nil {
 		panic(err.Error())
 	}
-	// Your Code Here (2A).
-	return nil
+	r := new(Raft)
+	r.id = c.ID
+	r.State = StateFollower
+	r.RaftLog = newLog(c.Storage)
+	return r
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
@@ -188,27 +192,47 @@ func (r *Raft) tick() {
 // becomeFollower transform this peer's state to Follower
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// Your Code Here (2A).
+	r.Term = term
+	r.Lead = lead
+	r.State = StateFollower
+	r.votes = nil
+	log.Infof("Node[%d] become to follower, leader is Node[%d]", r.id, r.Lead)
 }
 
 // becomeCandidate transform this peer's state to candidate
 func (r *Raft) becomeCandidate() {
 	// Your Code Here (2A).
+	r.Term++
+	r.State = StateCandidate
+	r.Vote = r.id
+	r.Lead = 0
+	r.votes = make(map[uint64]bool)
+	r.votes[r.id] = true
+	log.Infof("Node[%d] become to candidate: term(%d)", r.id, r.Term)
 }
 
 // becomeLeader transform this peer's state to leader
 func (r *Raft) becomeLeader() {
 	// Your Code Here (2A).
 	// NOTE: Leader should propose a noop entry on its term
+	r.State = StateLeader
+	r.votes = nil
+	r.Lead = r.id
+	for _, pr := range r.Prs {
+		pr.Match = 0
+		pr.Next = r.RaftLog.LastIndex() + 1
+	}
+	log.Infof("Node[%d] become to leader: term(%d),index(%d)", r.id, r.Term, r.RaftLog.LastIndex())
 }
 
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
-	switch r.State {
-	case StateFollower:
-	case StateCandidate:
-	case StateLeader:
+	switch m.GetMsgType() {
+	case pb.MessageType_MsgAppend:
+		r.handleMsgAppend(m)
+
 	}
 	return nil
 }
