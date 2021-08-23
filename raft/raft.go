@@ -17,6 +17,8 @@ package raft
 import (
 	"errors"
 	"github.com/pingcap-incubator/tinykv/log"
+	"math/rand"
+	"time"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -135,7 +137,9 @@ type Raft struct {
 	// heartbeat interval, should send
 	heartbeatTimeout int
 	// baseline of election interval
-	electionTimeout int
+	electionTimeout     int
+	baseElectionTimeout int
+
 	// number of ticks since it reached last heartbeatTimeout.
 	// only leader keeps heartbeatElapsed.
 	heartbeatElapsed int
@@ -171,15 +175,18 @@ func newRaft(c *Config) *Raft {
 		prs[peer] = new(Progress)
 		votes[peer] = false
 	}
-	return &Raft{
-		id:               c.ID,
-		State:            StateFollower,
-		RaftLog:          newLog(c.Storage),
-		heartbeatTimeout: c.HeartbeatTick,
-		electionTimeout:  c.ElectionTick,
-		Prs:              prs,
-		votes:            votes,
+	r := &Raft{
+		id:                  c.ID,
+		State:               StateFollower,
+		RaftLog:             newLog(c.Storage),
+		heartbeatTimeout:    c.HeartbeatTick,
+		baseElectionTimeout: c.ElectionTick,
+		Prs:                 prs,
+		votes:               votes,
 	}
+	rand.Seed(time.Now().UnixNano())
+	r.randomElection()
+	return r
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
@@ -190,12 +197,20 @@ func (r *Raft) sendAppend(to uint64) bool {
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
-func (r *Raft) sendHeartbeat(to uint64) {
+func (r *Raft) sendHeartbeat() {
 	// Your Code Here (2A).
-	if r.id == to {
-		return
+	r.heartbeatElapsed = 0
+	for to := range r.Prs {
+		if r.id == to {
+			continue
+		}
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType: pb.MessageType_MsgHeartbeat,
+			From:    r.id,
+			To:      to,
+			Term:    r.Term,
+		})
 	}
-	r.msgs = append(r.msgs, pb.Message{From: r.id, To: to, Term: r.Term, MsgType: pb.MessageType_MsgHeartbeat})
 }
 
 // tick advances the internal logical clock by a single tick.
@@ -204,14 +219,12 @@ func (r *Raft) tick() {
 	if r.State == StateLeader {
 		r.heartbeatElapsed++
 		if r.heartbeatElapsed >= r.heartbeatTimeout {
-			r.Step(pb.Message{MsgType: pb.MessageType_MsgBeat})
-			r.heartbeatElapsed = 0
+			_ = r.Step(pb.Message{MsgType: pb.MessageType_MsgBeat})
 		}
 	} else {
 		r.electionElapsed++
 		if r.electionElapsed >= r.electionTimeout {
-			r.Step(pb.Message{MsgType: pb.MessageType_MsgHup})
-			r.electionElapsed = 0
+			_ = r.Step(pb.Message{MsgType: pb.MessageType_MsgHup})
 		}
 	}
 }
@@ -235,6 +248,8 @@ func (r *Raft) becomeCandidate() {
 	r.Lead = 0
 	r.votes = make(map[uint64]bool)
 	r.votes[r.id] = true
+	r.electionElapsed = 0
+	r.randomElection()
 	log.Infof("Node[%d] become to candidate: term(%d)", r.id, r.Term)
 }
 
@@ -256,20 +271,41 @@ func (r *Raft) becomeLeader() {
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
-	switch m.GetMsgType() {
-	case pb.MessageType_MsgAppend:
-		r.handleAppendEntries(m)
-	case pb.MessageType_MsgBeat:
-		for id := range r.Prs {
-			r.sendHeartbeat(id)
+	switch r.State {
+	case StateLeader:
+		switch m.GetMsgType() {
+		case pb.MessageType_MsgAppend:
+			r.handleAppendEntries(m)
+		case pb.MessageType_MsgPropose:
+			r.handleMsgPropose(m)
+		case pb.MessageType_MsgBeat:
+			r.sendHeartbeat()
 		}
-	case pb.MessageType_MsgHup:
-		r.requestElection()
+	case StateFollower:
+		switch m.GetMsgType() {
+		case pb.MessageType_MsgAppend:
+			r.handleAppendEntries(m)
+		case pb.MessageType_MsgHup:
+			r.requestElection()
+		}
+	case StateCandidate:
+		switch m.GetMsgType() {
+		case pb.MessageType_MsgAppend:
+			r.handleAppendEntries(m)
+		case pb.MessageType_MsgHup:
+			r.requestElection()
+		}
+	}
+
+	switch m.GetMsgType() {
+
 	case pb.MessageType_MsgRequestVoteResponse:
 		r.handleVoteResponse(m)
 	case pb.MessageType_MsgRequestVote:
 		r.handleVote(m)
 
+	case pb.MessageType_MsgAppendResponse:
+		r.handleAppendResponse(m)
 	}
 	return nil
 }
@@ -305,6 +341,41 @@ func (r *Raft) requestElection() {
 				LogTerm: logTerm,
 			})
 		}
+	}
+}
 
+func (r *Raft) randomElection() {
+	r.electionTimeout = r.baseElectionTimeout + rand.Intn(r.baseElectionTimeout)
+}
+
+func (r *Raft) bcastAppend() {
+	for id := range r.Prs {
+		if id == r.id {
+			continue
+		}
+		offset := uint64(len(r.RaftLog.entries)) - 1 - (r.RaftLog.LastIndex() - r.Prs[id].Next)
+		ents := r.RaftLog.entries[offset:]
+		var entries []*pb.Entry
+		for i := 0; i < len(ents); i++ {
+			entries = append(entries, &ents[i])
+		}
+		if len(entries) == 0 {
+			continue
+		}
+
+		//index := r.RaftLog.entries[offset].Index - 1
+		index := r.Prs[id].Next - 1
+		logTerm, _ := r.RaftLog.Term(index)
+
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType: pb.MessageType_MsgAppend,
+			From:    r.id,
+			To:      id,
+			Term:    r.Term,
+			LogTerm: logTerm,
+			Index:   index,
+			Entries: entries,
+			Commit:  r.RaftLog.committed,
+		})
 	}
 }

@@ -7,17 +7,10 @@ import (
 
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
-	if m.GetMsgType() != pb.MessageType_MsgAppend {
-		panic("handleAppendEntries must hand MessageType_MsgAppend msg")
-	}
 	reject := func(msg *pb.Message) {
 		msg.Reject = true
 		r.msgs = append(r.msgs, *msg)
 	}
-	if (r.State == StateLeader || r.State == StateCandidate) && m.Term > r.Term {
-		r.becomeFollower(m.Term, m.From)
-	}
-
 	msg := pb.Message{
 		MsgType: pb.MessageType_MsgAppendResponse,
 		To:      m.From,
@@ -28,6 +21,17 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	if r.Term > m.Term {
 		reject(&msg)
 		return
+	}
+	// change state when discover a new term.
+	switch r.State {
+	case StateLeader:
+		if m.Term > r.Term {
+			r.becomeFollower(m.Term, m.From)
+		}
+	case StateCandidate:
+		if m.Term >= r.Term {
+			r.becomeFollower(m.Term, m.From)
+		}
 	}
 	// check log term and index
 	lt, err := r.RaftLog.storage.Term(m.Index)
@@ -42,7 +46,6 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		return
 	}
 	r.Term = m.Term
-
 }
 
 // handleHeartbeat handle Heartbeat RPC request
@@ -123,4 +126,35 @@ func (r *Raft) handleVote(m pb.Message) {
 		vote = checkNewLog()
 	}
 	r.msgs = append(r.msgs, voteMsg(vote))
+}
+
+func (r *Raft) handleMsgPropose(m pb.Message) {
+	empty := func() bool {
+		for i := range m.Entries {
+			if m.Entries[i].GetData() != nil {
+				return false
+			}
+		}
+		return true
+	}
+	if empty() {
+		_ = r.Step(pb.Message{MsgType: pb.MessageType_MsgBeat})
+		return
+	}
+	for _, ent := range m.Entries {
+		ent.Term = r.Term
+		ent.Index = r.RaftLog.LastIndex() + 1
+		r.RaftLog.entries = append(r.RaftLog.entries, *ent)
+	}
+	r.Prs[r.id].Match += uint64(len(m.Entries))
+	r.Prs[r.id].Next += uint64(len(m.Entries))
+
+	if len(r.Prs) == 1 {
+		r.RaftLog.committed += 1
+	}
+	r.bcastAppend()
+}
+
+func (r *Raft) handleAppendResponse(m pb.Message) {
+
 }
