@@ -249,7 +249,6 @@ func (r *Raft) becomeCandidate() {
 	r.votes = make(map[uint64]bool)
 	r.votes[r.id] = true
 	r.electionElapsed = 0
-	r.randomElection()
 	log.Infof("Node[%d] become to candidate: term(%d)", r.id, r.Term)
 }
 
@@ -280,6 +279,8 @@ func (r *Raft) Step(m pb.Message) error {
 			r.handleMsgPropose(m)
 		case pb.MessageType_MsgBeat:
 			r.sendHeartbeat()
+		case pb.MessageType_MsgAppendResponse:
+			r.handleAppendResponse(m)
 		}
 	case StateFollower:
 		switch m.GetMsgType() {
@@ -287,6 +288,8 @@ func (r *Raft) Step(m pb.Message) error {
 			r.handleAppendEntries(m)
 		case pb.MessageType_MsgHup:
 			r.requestElection()
+		case pb.MessageType_MsgRequestVote:
+			r.handleVote(m)
 		}
 	case StateCandidate:
 		switch m.GetMsgType() {
@@ -294,18 +297,9 @@ func (r *Raft) Step(m pb.Message) error {
 			r.handleAppendEntries(m)
 		case pb.MessageType_MsgHup:
 			r.requestElection()
+		case pb.MessageType_MsgRequestVoteResponse:
+			r.handleVoteResponse(m)
 		}
-	}
-
-	switch m.GetMsgType() {
-
-	case pb.MessageType_MsgRequestVoteResponse:
-		r.handleVoteResponse(m)
-	case pb.MessageType_MsgRequestVote:
-		r.handleVote(m)
-
-	case pb.MessageType_MsgAppendResponse:
-		r.handleAppendResponse(m)
 	}
 	return nil
 }
@@ -328,6 +322,7 @@ func (r *Raft) requestElection() {
 	}
 	index := r.RaftLog.LastIndex()
 	logTerm, _ := r.RaftLog.Term(index)
+	r.randomElection()
 	for id := range r.Prs {
 		if id == r.id {
 			r.votes[r.id] = true
@@ -353,7 +348,7 @@ func (r *Raft) bcastAppend() {
 		if id == r.id {
 			continue
 		}
-		offset := uint64(len(r.RaftLog.entries)) - 1 - (r.RaftLog.LastIndex() - r.Prs[id].Next)
+		offset := r.Prs[id].Next - 1 - r.RaftLog.stabled
 		ents := r.RaftLog.entries[offset:]
 		var entries []*pb.Entry
 		for i := 0; i < len(ents); i++ {
@@ -362,10 +357,7 @@ func (r *Raft) bcastAppend() {
 		if len(entries) == 0 {
 			continue
 		}
-
-		//index := r.RaftLog.entries[offset].Index - 1
-		index := r.Prs[id].Next - 1
-		logTerm, _ := r.RaftLog.Term(index)
+		logTerm, _ := r.RaftLog.Term(r.Prs[id].Next)
 
 		r.msgs = append(r.msgs, pb.Message{
 			MsgType: pb.MessageType_MsgAppend,
@@ -373,7 +365,7 @@ func (r *Raft) bcastAppend() {
 			To:      id,
 			Term:    r.Term,
 			LogTerm: logTerm,
-			Index:   index,
+			Index:   r.Prs[id].Match,
 			Entries: entries,
 			Commit:  r.RaftLog.committed,
 		})

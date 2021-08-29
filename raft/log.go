@@ -104,5 +104,6 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	if l.LastIndex() < i {
 		return 0, errors.New("index is over the last index of storage")
 	}
-	return l.entries[i].Term, nil
+	realIndex := i - l.stabled - 1
+	return l.entries[realIndex].Term, nil
 }

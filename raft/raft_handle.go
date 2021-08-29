@@ -25,10 +25,12 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	// change state when discover a new term.
 	switch r.State {
 	case StateLeader:
+		// the new leader term must greater than the another leader term.
 		if m.Term > r.Term {
 			r.becomeFollower(m.Term, m.From)
 		}
 	case StateCandidate:
+		// the new leader term maybe equal to the candidate term because of electoral competition.
 		if m.Term >= r.Term {
 			r.becomeFollower(m.Term, m.From)
 		}
@@ -75,16 +77,11 @@ func (r *Raft) handleVoteResponse(m pb.Message) {
 		}
 		return
 	}
-	switch r.State {
-	case StateCandidate:
-		r.votes[m.From] = !m.Reject
-		if !m.Reject {
-			if isMajor(getVoteNum()) {
-				r.becomeLeader()
-			}
+	r.votes[m.From] = !m.Reject
+	if !m.Reject {
+		if isMajor(getVoteNum()) {
+			r.becomeLeader()
 		}
-	default:
-		log.Debug("the vote response ignored when not candidate")
 	}
 }
 
@@ -117,15 +114,15 @@ func (r *Raft) handleVote(m pb.Message) {
 	switch {
 	case m.Term < r.Term:
 		vote = false
-	case m.Term > r.Term:
-		r.becomeFollower(m.Term, 0)
-		vote = checkNewLog()
 	case r.Vote != 0 && r.Vote != m.From:
 		vote = false
 	default:
 		vote = checkNewLog()
 	}
 	r.msgs = append(r.msgs, voteMsg(vote))
+	if vote {
+		r.becomeFollower(m.Term, m.From)
+	}
 }
 
 func (r *Raft) handleMsgPropose(m pb.Message) {
